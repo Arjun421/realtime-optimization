@@ -4,9 +4,7 @@ import { eventStore } from './db.js';
 import { dispatch } from './dispatch.js';
 import { sendToAgent } from './gateway.js';
 import { inc } from './metrics.js';
-import { keys, redis } from './redis.js';
-
-const REQUEST_TTL_S = 6 * 60 * 60;
+import { indexEnded, keys, redis, REQUEST_TTL_S } from './redis.js';
 
 export async function createRequest(input: { lat: number; lng: number; priority: Priority }) {
   const id = randomUUID();
@@ -23,6 +21,7 @@ export async function createRequest(input: { lat: number; lng: number; priority:
       updatedAt: now,
     })
     .expire(keys.req(id), REQUEST_TTL_S)
+    .zadd(keys.openRequests, now, id)
     .exec();
 
   inc('requestsCreated');
@@ -52,6 +51,7 @@ export async function getRequest(id: string) {
 export async function cancelRequest(id: string): Promise<boolean> {
   const freedAgent = await redis.cancelRequest(keys.req(id), keys.deadlines, id, Date.now());
   if (freedAgent === null) return false;
+  await indexEnded(id);
   inc('requestsCancelled');
   eventStore.record({ requestId: id, event: 'CANCELLED', agentId: freedAgent || undefined });
   if (freedAgent) sendToAgent(freedAgent, { type: 'offer_revoked', requestId: id, agentId: freedAgent });
@@ -109,6 +109,7 @@ export async function onTripUpdate(requestId: string, agentId: string, event: 'p
   }
   const ok = await redis.completeTrip(keys.agent(agentId), keys.req(requestId), requestId, agentId, now);
   if (ok) {
+    await indexEnded(requestId, now);
     inc('requestsCompleted');
     eventStore.record({ requestId, event: 'COMPLETED', agentId });
   }

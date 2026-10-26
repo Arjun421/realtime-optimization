@@ -10,8 +10,10 @@
     "infra:up": "docker compose up -d",
     "infra:down": "docker compose down",
     "dev:api": "npm run dev -w @dispatch/api",
+    "dev:live": "npm run dev:live -w @dispatch/api",
     "dev:sim": "npm run dev -w @dispatch/simulator",
-    "typecheck": "tsc -p apps/api && tsc -p apps/simulator"
+    "typecheck": "tsc -p apps/api && tsc -p apps/simulator && tsc -p apps/dashboard",
+    "dev:dashboard": "npm run dev -w @dispatch/dashboard"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

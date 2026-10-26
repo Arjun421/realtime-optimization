@@ -4,7 +4,7 @@ import { config } from './config.js';
 import { eventStore, migrate, pool } from './db.js';
 import { createGateway } from './gateway.js';
 import { fleetSnapshot, ingestLocations, startStaleSweeper } from './location.js';
-import { metrics } from './metrics.js';
+import { dispatchMetrics } from './metrics.js';
 import { redis } from './redis.js';
 import { cancelRequest, createRequest, getRequest, onOfferResponse, onTripUpdate, startOfferTimeouts } from './requests.js';
 
@@ -46,12 +46,10 @@ app.post<{ Params: { id: string } }>('/requests/:id/cancel', async (req, reply) 
   return { id: req.params.id, state: 'CANCELLED' };
 });
 
-app.get('/metrics', async () => ({
-  fleet: await fleetSnapshot(),
-  dispatchDecisionMs: metrics.decisionMs.summary(),
-  timeToFirstOfferMs: metrics.timeToFirstOfferMs.summary(),
-  counters: metrics.counters,
-}));
+app.get('/metrics', async () => ({ fleet: await fleetSnapshot(), ...dispatchMetrics() }));
+
+/** Polled by the live service; cheap because it touches no Redis. */
+app.get('/metrics/dispatch', async () => dispatchMetrics());
 
 const gateway = createGateway({
   onLocations: ingestLocations,

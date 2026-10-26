@@ -1,5 +1,5 @@
 /** Fixed-size ring buffer of recent samples; percentiles are computed on read. */
-class LatencySamples {
+export class LatencySamples {
   private samples: Float64Array;
   private next = 0;
   private filled = false;
@@ -50,4 +50,13 @@ export type Counter = keyof typeof metrics.counters;
 
 export function inc(counter: Counter, by = 1) {
   metrics.counters[counter] += by;
+}
+
+/** Everything this process measured itself (no Redis reads). */
+export function dispatchMetrics() {
+  return {
+    dispatchDecisionMs: metrics.decisionMs.summary(),
+    timeToFirstOfferMs: metrics.timeToFirstOfferMs.summary(),
+    counters: metrics.counters,
+  };
 }

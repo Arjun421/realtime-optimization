@@ -3,7 +3,7 @@ import { config } from './config.js';
 import { eventStore } from './db.js';
 import { sendToAgent } from './gateway.js';
 import { inc, metrics } from './metrics.js';
-import { keys, redis } from './redis.js';
+import { indexEnded, keys, redis } from './redis.js';
 import { rankCandidates, type Candidate } from './scoring.js';
 
 /**
@@ -48,6 +48,7 @@ async function findCandidates(
 async function markUnassigned(requestId: string, reason: string) {
   const ok = await redis.transition(keys.req(requestId), 'SEARCHING', 'UNASSIGNED', Date.now(), '');
   if (!ok) return;
+  await indexEnded(requestId);
   inc('requestsUnassigned');
   eventStore.record({ requestId, event: 'UNASSIGNED', data: { reason } });
 }

@@ -7,6 +7,10 @@ const num = (name: string, fallback: number) => {
 
 export const config = {
   port: num('PORT', 4000),
+  /** Port of the separate live-snapshot service (live-main.ts). */
+  livePort: num('LIVE_PORT', 4001),
+  /** Where the live service fetches dispatch metrics from. */
+  apiUrl: process.env.API_URL ?? 'http://localhost:4000',
   redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
   databaseUrl: process.env.DATABASE_URL ?? 'postgres://dispatch:dispatch@localhost:5432/dispatch',
 

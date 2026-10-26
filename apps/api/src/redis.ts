@@ -5,7 +5,10 @@ import { config } from './config.js';
  * Redis key layout
  *
  *   agents:geo          GEO   live positions of fresh agents (stale ones are swept out)
+ *   agents:pos          GEO   last known position of every tracked agent, stale included (dashboard only)
  *   agents:lastseen     ZSET  agentId -> last ping time (ms)
+ *   requests:open       ZSET  requestId -> createdAt, every request not yet finished (dashboard index)
+ *   requests:ended      ZSET  requestId -> endedAt, requests finished in the last few seconds (dashboard index)
  *   agent:{id}          HASH  status (AVAILABLE|OFFERED|BUSY), requestId
  *   req:{id}            HASH  state, lat, lng, priority, agentId, attempts, createdAt, updatedAt
  *   req:{id}:tried      SET   agents already offered this request (never re-offer)
@@ -13,7 +16,10 @@ import { config } from './config.js';
  */
 export const keys = {
   geo: 'agents:geo',
+  pos: 'agents:pos',
   lastSeen: 'agents:lastseen',
+  openRequests: 'requests:open',
+  endedRequests: 'requests:ended',
   deadlines: 'offers:deadlines',
   agent: (id: string) => `agent:${id}`,
   req: (id: string) => `req:${id}`,
@@ -108,6 +114,14 @@ end
 return ''
 `;
 
+/** Read-only bulk HMGET: one reply per key instead of one command per key.
+ *  KEYS: hashes. ARGV: fields. Returns one array of values per key. */
+const HMGET_MANY = `
+local out = {}
+for i, key in ipairs(KEYS) do out[i] = redis.call('HMGET', key, unpack(ARGV)) end
+return out
+`;
+
 type Arg = string | number;
 
 declare module 'ioredis' {
@@ -118,6 +132,7 @@ declare module 'ioredis' {
     transition(reqKey: string, ...argv: Arg[]): Result<number, Context>;
     completeTrip(agentKey: string, reqKey: string, ...argv: Arg[]): Result<number, Context>;
     cancelRequest(reqKey: string, deadlinesKey: string, ...argv: Arg[]): Result<string | null, Context>;
+    hmgetMany(numKeys: number, ...keysThenFields: string[]): Result<(string | null)[][], Context>;
   }
 }
 
@@ -129,3 +144,37 @@ redis.defineCommand('releaseOffer', { numberOfKeys: 4, lua: RELEASE_OFFER });
 redis.defineCommand('transition', { numberOfKeys: 1, lua: TRANSITION });
 redis.defineCommand('completeTrip', { numberOfKeys: 2, lua: COMPLETE_TRIP });
 redis.defineCommand('cancelRequest', { numberOfKeys: 2, lua: CANCEL_REQUEST });
+redis.defineCommand('hmgetMany', { lua: HMGET_MANY });
+
+export const REQUEST_TTL_S = 6 * 60 * 60;
+/** Finished requests stay on the dashboard this long. */
+export const ENDED_VISIBLE_MS = 5_000;
+
+/**
+ * Moves a finished request from the dashboard's open index to its ended index.
+ * Both indexes trim themselves here, so they stay small without a cleanup job.
+ * Not atomic with the state change: these keys only feed the dashboard, and
+ * the worst case is a request drawn one frame late.
+ */
+export async function indexEnded(requestId: string, now = Date.now()): Promise<void> {
+  await redis
+    .multi()
+    .zrem(keys.openRequests, requestId)
+    .zremrangebyscore(keys.openRequests, '-inf', now - REQUEST_TTL_S * 1000)
+    .zadd(keys.endedRequests, now, requestId)
+    .zremrangebyscore(keys.endedRequests, '-inf', now - ENDED_VISIBLE_MS)
+    .exec();
+}
+
+/** Scripts block Redis while they run, so bulk reads go in chunks to keep each one short. */
+const HMGET_CHUNK = 2_000;
+
+/** HMGET `fields` from every key, in order. */
+export async function hmgetMany(hashKeys: string[], fields: string[]): Promise<(string | null)[][]> {
+  const chunks: Promise<(string | null)[][]>[] = [];
+  for (let i = 0; i < hashKeys.length; i += HMGET_CHUNK) {
+    const slice = hashKeys.slice(i, i + HMGET_CHUNK);
+    chunks.push(redis.hmgetMany(slice.length, ...slice, ...fields));
+  }
+  return (await Promise.all(chunks)).flat();
+}

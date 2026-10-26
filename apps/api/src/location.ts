@@ -23,7 +23,7 @@ function isValid(p: LocationPing): boolean {
 }
 
 /**
- * Writes a batch of pings with two commands total (one GEOADD, one ZADD),
+ * Writes a batch of pings with three commands total (two GEOADDs, one ZADD),
  * however many agents are in the batch. That's what keeps 10k agents pinging
  * every few seconds cheap.
  */
@@ -49,6 +49,7 @@ export async function ingestLocations(items: LocationPing[]): Promise<void> {
   if (geoArgs.length === 0) return;
 
   pipeline.geoadd(keys.geo, ...geoArgs);
+  pipeline.geoadd(keys.pos, ...geoArgs);
   pipeline.zadd(keys.lastSeen, ...seenArgs);
   await pipeline.exec();
   inc('pingsIngested', geoArgs.length / 3);
@@ -69,6 +70,7 @@ export function startStaleSweeper(intervalMs = 2_000): NodeJS.Timeout {
       const forgotten = await redis.zrangebyscore(keys.lastSeen, '-inf', now - FORGET_AFTER_MS);
       if (forgotten.length) {
         await redis.zrem(keys.lastSeen, ...forgotten);
+        await redis.zrem(keys.pos, ...forgotten);
         forgotten.forEach((id) => knownAgents.delete(id));
       }
     } catch (err) {
@@ -82,12 +84,17 @@ export async function fleetSnapshot() {
   const scores = await redis.zrange(keys.lastSeen, 0, -1, 'WITHSCORES');
   const ages: number[] = [];
   for (let i = 1; i < scores.length; i += 2) ages.push(now - Number(scores[i]));
+  return fleetStats(ages);
+}
+
+/** Fresh/stale counts and median GPS age from each agent's time since last ping. */
+export function fleetStats(ages: number[]) {
   ages.sort((a, b) => a - b);
   const stale = ages.filter((a) => a > config.staleAfterMs).length;
   return {
     tracked: ages.length,
     fresh: ages.length - stale,
     stale,
-    medianFreshnessMs: ages.length ? ages[Math.floor(ages.length / 2)] : null,
+    medianFreshnessMs: ages[Math.floor(ages.length / 2)] ?? null,
   };
 }
