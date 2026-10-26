@@ -1,0 +1,21 @@
+{
+  "name": "realtime-dispatch",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "dev:api": "npm run dev -w @dispatch/api",
+    "dev:sim": "npm run dev -w @dispatch/simulator",
+    "typecheck": "tsc -p apps/api && tsc -p apps/simulator"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
