@@ -2,7 +2,9 @@ import { AGENT_LIVE_STATUSES, zoneLabel, type LatencySummary, type LiveSnapshot,
 import { useState, type ReactNode } from 'react';
 import { cssColor, type Palette, type RGBA, type Theme } from './colors';
 import { fmtDistance, fmtDuration, fmtInt, REQUEST_STATE_TEXT } from './format';
+import { RideTracker } from './RideTracker';
 import type { LiveState } from './useLive';
+import type { Ride } from './useRide';
 
 export type Selection = { kind: 'request' | 'agent'; id: string };
 type Tab = 'overview' | 'alerts' | 'system';
@@ -14,6 +16,9 @@ interface Props {
   onTheme(t: Theme): void;
   onHelp(): void;
   selection?: Selection;
+  /** The followed booking, when the selection is a booking. */
+  ride?: Ride;
+  rideDriverDistanceM?: number;
   onClearSelection(): void;
   priority: Priority;
   onPriority(p: Priority): void;
@@ -110,7 +115,7 @@ function Overview({ props, snap }: { props: Props; snap: LiveSnapshot }) {
 
   return (
     <>
-      {props.selection && <Selected snap={snap} selection={props.selection} palette={p} onClear={props.onClearSelection} />}
+      {props.selection?.kind === 'agent' && <Selected snap={snap} selection={props.selection} palette={p} onClear={props.onClearSelection} />}
 
       <Section title="Drivers right now">
         <Row label="Free" value={fmtInt(counts[0]!)} color={p.free} />
@@ -271,6 +276,17 @@ export function Panel(props: Props) {
           </button>
         </div>
       </header>
+
+      {props.selection?.kind === 'request' && (
+        <div className="ride-wrap">
+          <RideTracker
+            ride={props.ride}
+            driverDistanceM={props.rideDriverDistanceM}
+            now={snap?.at ?? Date.now()}
+            onClose={props.onClearSelection}
+          />
+        </div>
+      )}
 
       <nav className="tabs" role="tablist">
         {(['overview', 'alerts', 'system'] as Tab[]).map((t) => (

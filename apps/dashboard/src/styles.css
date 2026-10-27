@@ -542,6 +542,95 @@ table.latency td {
   font-weight: 600;
 }
 
+/* ---------- your ride ---------- */
+
+.ride-wrap {
+  padding: 0 16px 12px;
+}
+
+.ride {
+  margin: 0;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.ride.failed {
+  border-color: var(--bad);
+  background: var(--critical-bg);
+}
+
+.ride-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.ride-head .link {
+  margin: 0;
+}
+
+.steps {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+}
+
+.steps li {
+  position: relative;
+  padding: 3px 0 3px 22px;
+  color: var(--muted);
+}
+
+.steps li::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 8px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid var(--muted);
+  box-sizing: border-box;
+}
+
+.steps li.done {
+  color: var(--text-2);
+}
+
+.steps li.done::before {
+  background: var(--good);
+  border-color: var(--good);
+}
+
+.steps li.now {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.steps li.now::before {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.ride-detail {
+  margin: 6px 0 0;
+  font-weight: 600;
+}
+
+.ride-failed {
+  margin: 4px 0 0;
+  font-weight: 600;
+}
+
+.ride-meta {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* ---------- help ---------- */
 
 .help-backdrop {

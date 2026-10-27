@@ -3,6 +3,7 @@ import { DataFilterExtension, type DataFilterExtensionProps } from '@deck.gl/ext
 import { LineLayer, PolygonLayer, ScatterplotLayer } from '@deck.gl/layers';
 import DeckGL from '@deck.gl/react';
 import {
+  haversineMeters,
   zoneCenter,
   zonePolygon,
   type GpsAnomaly,
@@ -22,6 +23,7 @@ import { Legend, type Layers } from './Legend';
 import { Panel, type Selection } from './Panel';
 import { useDrivers } from './useDrivers';
 import { useLive } from './useLive';
+import { useRide } from './useRide';
 
 /** The whole simulated city, nudged north so the stat tiles don't cover its top edge. */
 const INITIAL_VIEW: MapViewState = { longitude: 77.095, latitude: 28.665, zoom: 10.3, pitch: 0, bearing: 0 };
@@ -105,17 +107,28 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- driverPos reads `drivers`
   }, [snap, drivers, layers.matched, p]);
 
-  /** Ring around whatever the panel is following. */
+  /** The booking being followed, polled from the API so it can be told start to finish. */
+  const ride = useRide(selection?.kind === 'request' ? selection.id : undefined);
+  const rideDriver = useMemo(() => {
+    if (!ride?.agentId || !['OFFERED', 'ASSIGNED', 'PICKED_UP'].includes(ride.state)) return undefined;
+    const slot = drivers?.slotOf.get(ride.agentId);
+    if (slot === undefined) return undefined;
+    const pos = driverPos(slot);
+    return { pos, distanceM: haversineMeters({ lng: pos[0], lat: pos[1] }, ride) };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- driverPos reads `drivers`
+  }, [ride, drivers]);
+
+  /** Ring around whatever the panel is following: a driver, the pickup, or the car once picked up. */
   const selected = useMemo((): [number, number] | undefined => {
-    if (!snap || !selection) return undefined;
+    if (!selection) return undefined;
     if (selection.kind === 'agent') {
       const slot = drivers?.slotOf.get(selection.id);
       return slot === undefined ? undefined : driverPos(slot);
     }
-    const r = snap.requests.find((x) => x.id === selection.id);
-    return r ? [r.lng, r.lat] : undefined;
+    if (ride?.state === 'PICKED_UP') return rideDriver?.pos;
+    return ride ? [ride.lng, ride.lat] : undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- driverPos reads `drivers`
-  }, [snap, selection, drivers]);
+  }, [selection, drivers, ride, rideDriver]);
 
   const jumps = useMemo(
     () => (snap && layers.jumps ? snap.anomalies.filter((a) => snap.at - a.at < JUMP_VISIBLE_MS) : []),
@@ -222,6 +235,43 @@ export function App() {
         autoHighlight: true,
         updateTriggers: { getFillColor: theme, getLineColor: theme },
       }),
+      // The followed booking: its pickup, its driver, and the route between them.
+      new LineLayer<[number, number]>({
+        id: 'ride-route',
+        data: rideDriver && ride && (ride.state === 'OFFERED' || ride.state === 'ASSIGNED') ? [rideDriver.pos] : [],
+        getSourcePosition: (d) => d,
+        getTargetPosition: () => [ride!.lng, ride!.lat],
+        getColor: ride?.state === 'OFFERED' ? p.offered : p.free,
+        getWidth: 4,
+        updateTriggers: { getTargetPosition: ride?.id, getColor: [ride?.state, theme] },
+      }),
+      new ScatterplotLayer<[number, number]>({
+        id: 'ride-pickup',
+        data: ride && ride.state !== 'PICKED_UP' && ride.state !== 'COMPLETED' ? [[ride.lng, ride.lat]] : [],
+        getPosition: (d) => d,
+        getFillColor: ride?.state === 'UNASSIGNED' || ride?.state === 'CANCELLED' ? [0, 0, 0, 0] : p.waiting,
+        getLineColor: ride?.state === 'UNASSIGNED' || ride?.state === 'CANCELLED' ? p.waiting : p.ring,
+        stroked: true,
+        radiusUnits: 'pixels',
+        getRadius: 9,
+        lineWidthUnits: 'pixels',
+        getLineWidth: 3,
+        updateTriggers: { getFillColor: [ride?.state, theme], getLineColor: [ride?.state, theme] },
+      }),
+      new ScatterplotLayer<[number, number]>({
+        id: 'ride-driver',
+        data: rideDriver && ride?.state !== 'PICKED_UP' ? [rideDriver.pos] : [],
+        getPosition: (d) => d,
+        getFillColor: ride?.state === 'OFFERED' ? p.offered : p.free,
+        getLineColor: p.ring,
+        stroked: true,
+        radiusUnits: 'pixels',
+        getRadius: 7,
+        lineWidthUnits: 'pixels',
+        getLineWidth: 2,
+        transitions: GLIDE,
+        updateTriggers: { getFillColor: [ride?.state, theme], getLineColor: theme },
+      }),
       new ScatterplotLayer<[number, number]>({
         id: 'selected',
         data: selected ? [selected] : [],
@@ -238,7 +288,7 @@ export function App() {
       }),
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps -- driverPos reads `drivers`
-  }, [snap, drivers, customers, links, jumps, layers, p, theme, selected]);
+  }, [snap, drivers, customers, links, jumps, layers, p, theme, selected, ride, rideDriver]);
 
   const flash = (msg: string) => {
     setToast(msg);
@@ -277,7 +327,11 @@ export function App() {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const { id } = (await res.json()) as { id: string };
         setSelection({ kind: 'request', id });
-        flash('Ride booked. Watch it get a driver.');
+        flash('Ride booked. Follow it in "Your ride" on the right.');
+        // Zoom in so the driver coming to the pickup is visible, not a dot among 10,000.
+        if (view.zoom < 13) {
+          setView({ ...view, longitude: lng, latitude: lat, zoom: 13.5, transitionDuration: 800, transitionInterpolator: new FlyToInterpolator() });
+        }
       })
       .catch((err: Error) => flash(`Couldn't book: ${err.message}`));
   };
@@ -333,6 +387,8 @@ export function App() {
         onTheme={setTheme}
         onHelp={() => setHelp(true)}
         selection={selection}
+        ride={ride}
+        rideDriverDistanceM={rideDriver?.distanceM}
         onClearSelection={() => setSelection(undefined)}
         priority={priority}
         onPriority={setPriority}

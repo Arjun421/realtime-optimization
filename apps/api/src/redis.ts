@@ -5,6 +5,7 @@ import { config } from './config.js';
  * Redis key layout
  *
  *   agents:geo          GEO   live positions of fresh agents (stale ones are swept out)
+ *   agents:free         GEO   the AVAILABLE subset of agents:geo: what dispatch searches
  *   agents:pos          GEO   last known position of every tracked agent, stale included (dashboard only)
  *   agents:lastseen     ZSET  agentId -> last ping time (ms)
  *   requests:open       ZSET  requestId -> createdAt, every request not yet finished (dashboard index)
@@ -20,6 +21,7 @@ import { config } from './config.js';
  */
 export const keys = {
   geo: 'agents:geo',
+  free: 'agents:free',
   pos: 'agents:pos',
   lastSeen: 'agents:lastseen',
   openRequests: 'requests:open',
@@ -40,11 +42,29 @@ export const keys = {
  * "accept" from racing an offer timeout.
  */
 
-/** KEYS: agent, req, deadlines. ARGV: reqId, agentId, now, deadline, distanceM.
+/*
+ * agents:free holds only AVAILABLE agents, so a search returns the nearest free
+ * agents directly. Searching every agent and filtering afterwards let a crowd of
+ * busy agents in a hotspot fill the whole result list and hide free ones further
+ * out: a booking at Connaught Place came back "no agent found" while 522 free
+ * agents were within 10 km. Every script that changes an agent's status keeps
+ * this index in step, in the same atomic step.
+ */
+
+/** Puts an agent that just became AVAILABLE back in the free index, at its live position. */
+const MARK_FREE = `
+local function markFree(freeKey, geoKey, agentId)
+  local pos = redis.call('GEOPOS', geoKey, agentId)[1]
+  if pos then redis.call('GEOADD', freeKey, pos[1], pos[2], agentId) end
+end
+`;
+
+/** KEYS: agent, req, deadlines, free. ARGV: reqId, agentId, now, deadline, distanceM.
  *  Returns 1 = claimed, 0 = agent not available, -1 = request no longer searching. */
 const CLAIM_AGENT = `
 if redis.call('HGET', KEYS[2], 'state') ~= 'SEARCHING' then return -1 end
 if redis.call('HGET', KEYS[1], 'status') ~= 'AVAILABLE' then return 0 end
+redis.call('ZREM', KEYS[4], ARGV[2])
 redis.call('HSET', KEYS[1], 'status', 'OFFERED', 'requestId', ARGV[1])
 redis.call('HSET', KEYS[2], 'state', 'OFFERED', 'agentId', ARGV[2], 'updatedAt', ARGV[3], 'offerDistM', ARGV[5])
 redis.call('HINCRBY', KEYS[2], 'attempts', 1)
@@ -65,8 +85,8 @@ return 1
 `;
 
 /** Rejection or timeout: free the agent, remember it was tried, go back to SEARCHING.
- *  KEYS: agent, req, deadlines, tried. ARGV: reqId, agentId, now. Returns 1 if released. */
-const RELEASE_OFFER = `
+ *  KEYS: agent, req, deadlines, tried, free, geo. ARGV: reqId, agentId, now. Returns 1 if released. */
+const RELEASE_OFFER = MARK_FREE + `
 if redis.call('HGET', KEYS[2], 'state') ~= 'OFFERED' then return 0 end
 if redis.call('HGET', KEYS[2], 'agentId') ~= ARGV[2] then return 0 end
 redis.call('HSET', KEYS[2], 'state', 'SEARCHING', 'updatedAt', ARGV[3])
@@ -74,6 +94,7 @@ redis.call('HDEL', KEYS[2], 'agentId')
 if redis.call('HGET', KEYS[1], 'requestId') == ARGV[1] then
   redis.call('HSET', KEYS[1], 'status', 'AVAILABLE')
   redis.call('HDEL', KEYS[1], 'requestId')
+  markFree(KEYS[5], KEYS[6], ARGV[2])
 end
 redis.call('HINCRBY', KEYS[1], 'offers', 1)
 redis.call('ZREM', KEYS[3], ARGV[1] .. '|' .. ARGV[2])
@@ -91,22 +112,23 @@ redis.call('HSET', KEYS[1], 'state', ARGV[2], 'updatedAt', ARGV[3])
 return 1
 `;
 
-/** KEYS: agent, req. ARGV: reqId, agentId, now. Returns 1 if completed. */
-const COMPLETE_TRIP = `
+/** KEYS: agent, req, free, geo. ARGV: reqId, agentId, now. Returns 1 if completed. */
+const COMPLETE_TRIP = MARK_FREE + `
 if redis.call('HGET', KEYS[2], 'state') ~= 'PICKED_UP' then return 0 end
 if redis.call('HGET', KEYS[2], 'agentId') ~= ARGV[2] then return 0 end
 redis.call('HSET', KEYS[2], 'state', 'COMPLETED', 'updatedAt', ARGV[3])
 if redis.call('HGET', KEYS[1], 'requestId') == ARGV[1] then
   redis.call('HSET', KEYS[1], 'status', 'AVAILABLE')
   redis.call('HDEL', KEYS[1], 'requestId')
+  markFree(KEYS[3], KEYS[4], ARGV[2])
 end
 return 1
 `;
 
-/** KEYS: req, deadlines. ARGV: reqId, now.
+/** KEYS: req, deadlines, free, geo. ARGV: reqId, now.
  *  Returns the freed agentId ('' if none), or false if the request was already terminal.
  *  Builds the agent key inside the script, which is fine on a single Redis node. */
-const CANCEL_REQUEST = `
+const CANCEL_REQUEST = MARK_FREE + `
 local state = redis.call('HGET', KEYS[1], 'state')
 if not state or state == 'COMPLETED' or state == 'UNASSIGNED' or state == 'CANCELLED' or state == 'PICKED_UP' then
   return false
@@ -119,6 +141,7 @@ if agentId then
   if redis.call('HGET', agentKey, 'requestId') == ARGV[1] then
     redis.call('HSET', agentKey, 'status', 'AVAILABLE')
     redis.call('HDEL', agentKey, 'requestId')
+    markFree(KEYS[3], KEYS[4], agentId)
   end
   return agentId
 end
@@ -144,6 +167,17 @@ if useQueue then redis.call('ZADD', KEYS[3], ARGV[7], ARGV[1]) end
 return 1
 `;
 
+/** Adds the AVAILABLE agents among a batch of pings to the free index (the others stay out).
+ *  KEYS: free. ARGV: lng, lat, agentId, repeated. Builds agent keys inside (single node). */
+const INDEX_FREE = `
+for i = 1, #ARGV, 3 do
+  if redis.call('HGET', 'agent:' .. ARGV[i + 2], 'status') == 'AVAILABLE' then
+    redis.call('GEOADD', KEYS[1], ARGV[i], ARGV[i + 1], ARGV[i + 2])
+  end
+end
+return 1
+`;
+
 /** Read-only bulk HMGET: one reply per key instead of one command per key.
  *  KEYS: hashes. ARGV: fields. Returns one array of values per key. */
 const HMGET_MANY = `
@@ -156,12 +190,13 @@ type Arg = string | number;
 
 declare module 'ioredis' {
   interface RedisCommander<Context> {
-    claimAgent(agentKey: string, reqKey: string, deadlinesKey: string, ...argv: Arg[]): Result<number, Context>;
+    claimAgent(agentKey: string, reqKey: string, deadlinesKey: string, freeKey: string, ...argv: Arg[]): Result<number, Context>;
     acceptOffer(agentKey: string, reqKey: string, deadlinesKey: string, ...argv: Arg[]): Result<number, Context>;
-    releaseOffer(agentKey: string, reqKey: string, deadlinesKey: string, triedKey: string, ...argv: Arg[]): Result<number, Context>;
+    releaseOffer(agentKey: string, reqKey: string, deadlinesKey: string, triedKey: string, freeKey: string, geoKey: string, ...argv: Arg[]): Result<number, Context>;
     transition(reqKey: string, ...argv: Arg[]): Result<number, Context>;
-    completeTrip(agentKey: string, reqKey: string, ...argv: Arg[]): Result<number, Context>;
-    cancelRequest(reqKey: string, deadlinesKey: string, ...argv: Arg[]): Result<string | null, Context>;
+    completeTrip(agentKey: string, reqKey: string, freeKey: string, geoKey: string, ...argv: Arg[]): Result<number, Context>;
+    cancelRequest(reqKey: string, deadlinesKey: string, freeKey: string, geoKey: string, ...argv: Arg[]): Result<string | null, Context>;
+    indexFree(freeKey: string, ...argv: Arg[]): Result<number, Context>;
     hmgetMany(numKeys: number, ...keysThenFields: string[]): Result<(string | null)[][], Context>;
     createRequest(reqKey: string, openKey: string, queueKey: string, bucketKey: string, ...argv: Arg[]): Result<number, Context>;
   }
@@ -169,12 +204,13 @@ declare module 'ioredis' {
 
 export const redis = new Redis(config.redisUrl, { maxRetriesPerRequest: 3 });
 
-redis.defineCommand('claimAgent', { numberOfKeys: 3, lua: CLAIM_AGENT });
+redis.defineCommand('claimAgent', { numberOfKeys: 4, lua: CLAIM_AGENT });
 redis.defineCommand('acceptOffer', { numberOfKeys: 3, lua: ACCEPT_OFFER });
-redis.defineCommand('releaseOffer', { numberOfKeys: 4, lua: RELEASE_OFFER });
+redis.defineCommand('releaseOffer', { numberOfKeys: 6, lua: RELEASE_OFFER });
 redis.defineCommand('transition', { numberOfKeys: 1, lua: TRANSITION });
-redis.defineCommand('completeTrip', { numberOfKeys: 2, lua: COMPLETE_TRIP });
-redis.defineCommand('cancelRequest', { numberOfKeys: 2, lua: CANCEL_REQUEST });
+redis.defineCommand('completeTrip', { numberOfKeys: 4, lua: COMPLETE_TRIP });
+redis.defineCommand('cancelRequest', { numberOfKeys: 4, lua: CANCEL_REQUEST });
+redis.defineCommand('indexFree', { numberOfKeys: 1, lua: INDEX_FREE });
 redis.defineCommand('hmgetMany', { lua: HMGET_MANY });
 redis.defineCommand('createRequest', { numberOfKeys: 4, lua: CREATE_REQUEST });
 

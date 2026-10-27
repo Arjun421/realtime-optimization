@@ -7,7 +7,7 @@ A walkthrough of the live dashboard for an interview or a screen share: what to 
 Start everything about 5 minutes early, so the trend lines on top have filled in:
 
 ```bash
-AGENTS=10000 REQUESTS_PER_SEC=15 npm run dev
+AGENTS=10000 REQUESTS_PER_SEC=10 npm run dev
 ```
 
 Open the dashboard URL that Vite prints (usually http://localhost:5173). Add `?theme=dark` for dark mode.
@@ -33,8 +33,9 @@ Open the dashboard URL that Vite prints (usually http://localhost:5173). Add `?t
 
 > "Let me book a ride right here."
 
-**Point at:** the new red circle, the amber line to a driver, and the "Selected customer" box in the panel as it changes
-from *Looking for a driver* → *Offered…* → *Driver accepted and is on the way*.
+**Point at:** the map zooming in to the red pin, the line to the driver, and the **Your ride** card at the top of the
+panel as it ticks through *Looking for a driver* → *Offer sent* → *Driver on the way (distance, arriving in…)*. If the
+first driver says no, the card says so and the next one is asked.
 
 > "The system searched nearby drivers, ranked them, locked the best one so no other booking can take them, and sent
 > an offer, in about 5 milliseconds. The amber line is the offer. The driver has 8 seconds; if they say no, it

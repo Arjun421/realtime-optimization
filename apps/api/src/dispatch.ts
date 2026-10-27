@@ -9,7 +9,8 @@ import { readZoneStats } from './zones.js';
 
 /**
  * Nearby agents that can take work right now: AVAILABLE, fresh GPS, and not
- * already offered this request. Also returns what ranking needs about them
+ * already offered this request. Searches the free-agent index, so busy agents
+ * crowding a hotspot can't push free ones out of the result list. Also returns what ranking needs about them
  * (acceptance history, zone) in the same round trip.
  */
 async function findCandidates(
@@ -19,7 +20,7 @@ async function findCandidates(
   tried: Set<string>,
 ): Promise<Candidate[]> {
   const raw = (await redis.call(
-    'GEOSEARCH', keys.geo,
+    'GEOSEARCH', keys.free,
     'FROMLONLAT', pickup.lng, pickup.lat,
     'BYRADIUS', radiusKm, 'km',
     'ASC', 'COUNT', limit, 'WITHDIST', 'WITHCOORD',
@@ -82,9 +83,9 @@ export async function dispatch(requestId: string): Promise<void> {
   const pickupZone = zoneOf(pickup);
   const tried = new Set(await redis.smembers(keys.tried(requestId)));
 
-  for (const [i, radiusKm] of config.searchRadiiKm.entries()) {
-    // Widen the result count with the radius, or a crowd of busy agents
-    // close by would hide available ones further out.
+  const radii = config.searchRadiiKm.filter((r) => r <= config.maxPickupKm[priority]);
+  for (const [i, radiusKm] of radii.entries()) {
+    // Bigger radius, more results: agents already tried for this request still take up slots.
     const limit = config.candidatesPerSearch * 2 ** i;
     const candidates = await findCandidates(pickup, radiusKm, limit, tried);
     if (candidates.length === 0) continue;
@@ -98,7 +99,7 @@ export async function dispatch(requestId: string): Promise<void> {
       const now = Date.now();
       const expiresAt = now + config.offerTimeoutMs;
       const claimed = await redis.claimAgent(
-        keys.agent(candidate.agentId), keys.req(requestId), keys.deadlines,
+        keys.agent(candidate.agentId), keys.req(requestId), keys.deadlines, keys.free,
         requestId, candidate.agentId, now, expiresAt, Math.round(candidate.distanceM),
       );
       if (claimed === -1) return; // request was cancelled meanwhile

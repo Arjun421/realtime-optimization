@@ -29,6 +29,18 @@ export const config = {
   maxOfferAttempts: num('MAX_OFFER_ATTEMPTS', 5),
   /** Candidate search widens through these radii until someone eligible is found. */
   searchRadiiKm: [2, 5, 10, 20],
+  /**
+   * Furthest a driver may be sent for a pickup, by priority. Without a cap, a booking
+   * in a busy area gets a driver 14+ km away; that driver is then tied up for 20+ min,
+   * which empties more areas, so the next bookings reach even further: the fleet
+   * spirals into "everyone busy". Better to say "no driver nearby", except for an emergency.
+   */
+  maxPickupKm: {
+    low: num('MAX_PICKUP_KM_LOW', 3),
+    normal: num('MAX_PICKUP_KM_NORMAL', 5),
+    high: num('MAX_PICKUP_KM_HIGH', 10),
+    critical: num('MAX_PICKUP_KM_CRITICAL', 20),
+  },
   candidatesPerSearch: num('CANDIDATES_PER_SEARCH', 50),
 
   /**

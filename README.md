@@ -43,9 +43,19 @@ any open state → CANCELLED
 Key design decisions:
 
 - **No double assignment.** Claiming an agent is a Lua script that checks the agent is `AVAILABLE` and the request is still `SEARCHING`, then flips both in one atomic step.
+- **Search only free drivers.** Dispatch searches `agents:free`, a GEO index holding only `AVAILABLE` drivers, kept in
+  step by the same Lua scripts that change a driver's status. The first version searched every driver and filtered out
+  busy ones afterwards, taking the nearest 50/100/200/400 per radius. In a busy hotspot that list filled up with busy
+  drivers: a booking at Connaught Place was marked "no driver found" while 522 free drivers were within 10 km. Found by
+  booking a ride on the dashboard and watching it fail.
+- **A maximum pickup distance per priority** (low 3 km, normal 5 km, high 10 km, critical 20 km). Once free drivers far
+  away became reachable, normal bookings were being sent drivers 14 km away; those drivers were tied up for 20+ minutes,
+  emptying more areas, so the next bookings reached further still, until almost the whole fleet was busy. Saying "no
+  driver nearby" beats a 20-minute pickup, except in an emergency.
 - **Durable offer timeouts.** Deadlines live in a Redis sorted set, not in-process timers, so they survive restarts and work across multiple API instances.
 - **Stale GPS is never dispatched.** A sweeper removes agents with no ping in 15s from the geo index, and dispatch re-checks freshness itself.
-- **Cheap ingestion.** Each batch of pings, however large, becomes one `GEOADD` plus one `ZADD`.
+- **Cheap ingestion.** Each batch of pings, however large, becomes a fixed handful of commands (positions, last-seen, and
+  one script that refreshes the free drivers' entries in `agents:free`).
 - **The hot path never waits on Postgres.** Events are buffered and bulk-inserted every 500ms.
 - **The dashboard doesn't slow dispatch down.** Snapshots are built in a separate process that only reads Redis.
   The first version built them inside the API and pushed dispatch p99 from ~20 ms to ~34 ms: Node runs one
@@ -108,10 +118,11 @@ npm install
 npm run dev
 ```
 
-Bigger run (each trip takes several minutes, so ~15 req/s keeps 10,000 agents busy without running out):
+Bigger run (each trip takes several minutes; ~10 req/s keeps 10,000 agents busy for hours without running out, while
+15 req/s slowly exhausts the fleet):
 
 ```bash
-AGENTS=10000 REQUESTS_PER_SEC=15 npm run dev
+AGENTS=10000 REQUESTS_PER_SEC=10 npm run dev
 ```
 
 Each part can also run on its own: `npm run dev:api`, `dev:live`, `dev:sim`, `dev:dashboard`.
@@ -150,13 +161,14 @@ API:
 | `WS` | `:4001/live` | dashboard snapshot stream (see `packages/shared/src/live.ts`) |
 | `GET` | `:4001/alerts` | current zone alerts |
 
-The dashboard: hover anything for details, click a driver or customer to follow it, click an empty spot to book a
-ride there (pick the priority in the panel), and click a zone alert to fly to it. The legend's checkboxes show the
+The dashboard: hover anything for details, click a driver to follow it, click an empty spot to book a ride there (pick
+the priority in the panel): the map zooms in and a "Your ride" card follows it step by step (looking → offered →
+driver on the way, with distance → in the car → finished). Click a zone alert to fly to it. The legend's checkboxes show the
 optional layers (busy drivers, matched customers, short areas, blocked GPS jumps). `?theme=dark` forces dark mode.
 
 Simulator settings (env): `AGENTS`, `REQUESTS_PER_SEC`, `PING_INTERVAL_MS`, `DARK_RATE`, `IGNORE_OFFER_RATE`,
 `GPS_GLITCH_RATE`, `API_URL`. API and live service: `DISPATCH_STRATEGY` (`smart` | `ml` | `nearest`), `QUEUE_ENABLED`, `DISPATCH_WORKERS`
-(default 128), `MAX_QUEUE` (default 2,000), and the `SCORE_*` weights in `apps/api/src/config.ts`.
+(default 128), `MAX_QUEUE` (default 2,000), `MAX_PICKUP_KM_{LOW,NORMAL,HIGH,CRITICAL}` (3 / 5 / 10 / 20 km), and the `SCORE_*` weights in `apps/api/src/config.ts`.
 
 ## Measured so far
 

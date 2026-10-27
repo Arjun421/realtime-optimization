@@ -26,7 +26,8 @@ function isValid(p: LocationPing): boolean {
 }
 
 /**
- * Writes a batch of pings with three commands total (two GEOADDs, one ZADD),
+ * Writes a batch of pings with four commands total (two GEOADDs, one ZADD, one
+ * script that adds the AVAILABLE ones to the free index),
  * however many agents are in the batch. That's what keeps 10k agents pinging
  * every few seconds cheap. Impossible jumps are filtered out first.
  */
@@ -71,6 +72,8 @@ export async function ingestLocations(items: LocationPing[]): Promise<void> {
 
   pipeline.geoadd(keys.geo, ...geoArgs);
   pipeline.geoadd(keys.pos, ...geoArgs);
+  // After the HSETNX above, so a brand-new agent is already AVAILABLE when this runs.
+  pipeline.indexFree(keys.free, ...geoArgs);
   pipeline.zadd(keys.lastSeen, ...seenArgs);
   await pipeline.exec();
   inc('pingsIngested', geoArgs.length / 3);
@@ -86,12 +89,16 @@ export function startStaleSweeper(intervalMs = 2_000): NodeJS.Timeout {
     try {
       const now = Date.now();
       const stale = await redis.zrangebyscore(keys.lastSeen, '-inf', now - config.staleAfterMs);
-      if (stale.length) await redis.zrem(keys.geo, ...stale);
+      if (stale.length) {
+        await redis.zrem(keys.geo, ...stale);
+        await redis.zrem(keys.free, ...stale);
+      }
 
       const forgotten = await redis.zrangebyscore(keys.lastSeen, '-inf', now - FORGET_AFTER_MS);
       if (forgotten.length) {
         await redis.zrem(keys.lastSeen, ...forgotten);
         await redis.zrem(keys.pos, ...forgotten);
+        await redis.zrem(keys.free, ...forgotten);
         for (const id of forgotten) {
           knownAgents.delete(id);
           forgetAgent(id);

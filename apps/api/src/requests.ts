@@ -55,7 +55,7 @@ export async function getRequest(id: string) {
 }
 
 export async function cancelRequest(id: string): Promise<boolean> {
-  const freedAgent = await redis.cancelRequest(keys.req(id), keys.deadlines, id, Date.now());
+  const freedAgent = await redis.cancelRequest(keys.req(id), keys.deadlines, keys.free, keys.geo, id, Date.now());
   if (freedAgent === null) return false;
   await indexEnded(id);
   inc('requestsCancelled');
@@ -67,7 +67,7 @@ export async function cancelRequest(id: string): Promise<boolean> {
 /** Agent turned the offer down, or it expired: free them and find someone else. */
 async function releaseAndRedispatch(requestId: string, agentId: string, reason: 'rejected' | 'timeout') {
   const released = await redis.releaseOffer(
-    keys.agent(agentId), keys.req(requestId), keys.deadlines, keys.tried(requestId),
+    keys.agent(agentId), keys.req(requestId), keys.deadlines, keys.tried(requestId), keys.free, keys.geo,
     requestId, agentId, Date.now(),
   );
   if (!released) return false;
@@ -119,7 +119,7 @@ export async function onTripUpdate(requestId: string, agentId: string, event: 'p
     if (createdAt) metrics.waitToPickupMs.add(now - Number(createdAt));
     return;
   }
-  const ok = await redis.completeTrip(keys.agent(agentId), keys.req(requestId), requestId, agentId, now);
+  const ok = await redis.completeTrip(keys.agent(agentId), keys.req(requestId), keys.free, keys.geo, requestId, agentId, now);
   if (ok) {
     await indexEnded(requestId, now);
     inc('requestsCompleted');
