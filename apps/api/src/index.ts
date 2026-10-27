@@ -4,9 +4,19 @@ import { config } from './config.js';
 import { eventStore, migrate, pool } from './db.js';
 import { createGateway } from './gateway.js';
 import { fleetSnapshot, ingestLocations, startStaleSweeper } from './location.js';
-import { dispatchMetrics } from './metrics.js';
+import { dispatchMetrics, resetMetrics } from './metrics.js';
+import { loadModels } from './ml.js';
+import { queueDepth, startDispatchWorkers, startStuckRequestRecovery } from './queue.js';
 import { redis } from './redis.js';
-import { cancelRequest, createRequest, getRequest, onOfferResponse, onTripUpdate, startOfferTimeouts } from './requests.js';
+import {
+  cancelRequest,
+  createRequest,
+  getRequest,
+  onOfferResponse,
+  onTripUpdate,
+  startDispatch,
+  startOfferTimeouts,
+} from './requests.js';
 
 const app = Fastify({ logger: { level: 'info' }, disableRequestLogging: true });
 
@@ -29,8 +39,13 @@ app.post<{ Body: { lat: number; lng: number; priority?: Priority } }>(
   },
   async (req, reply) => {
     const { lat, lng, priority = 'normal' } = req.body;
+    const created = await createRequest({ lat, lng, priority });
+    if (!created) {
+      // Shedding load here keeps latency flat for the requests we did accept.
+      return reply.code(429).header('retry-after', '1').send({ error: 'queue_full' });
+    }
     reply.code(201);
-    return createRequest({ lat, lng, priority });
+    return created;
   },
 );
 
@@ -46,10 +61,23 @@ app.post<{ Params: { id: string } }>('/requests/:id/cancel', async (req, reply) 
   return { id: req.params.id, state: 'CANCELLED' };
 });
 
-app.get('/metrics', async () => ({ fleet: await fleetSnapshot(), ...dispatchMetrics() }));
+const queueStatus = async () => ({
+  enabled: config.queueEnabled,
+  workers: config.queueEnabled ? config.dispatchWorkers : 0,
+  maxDepth: config.maxQueue,
+  depth: await queueDepth(),
+});
 
-/** Polled by the live service; cheap because it touches no Redis. */
-app.get('/metrics/dispatch', async () => dispatchMetrics());
+app.get('/metrics', async () => ({ fleet: await fleetSnapshot(), queue: await queueStatus(), ...dispatchMetrics() }));
+
+/** Polled by the live service; one ZCARD, nothing else touches Redis. */
+app.get('/metrics/dispatch', async () => ({ queue: await queueStatus(), ...dispatchMetrics() }));
+
+/** Lets a benchmark discard its warm-up period. */
+app.post('/metrics/reset', async () => {
+  resetMetrics();
+  return { ok: true };
+});
 
 const gateway = createGateway({
   onLocations: ingestLocations,
@@ -67,15 +95,18 @@ app.server.on('upgrade', (req, socket, head) => {
 });
 
 async function main() {
+  if (config.strategy === 'ml') loadModels(); // fail at startup, not on the first request, if a model file is missing
   await migrate();
   eventStore.start();
-  const timers = [startStaleSweeper(), startOfferTimeouts()];
+  const timers = [startStaleSweeper(), startOfferTimeouts(), startStuckRequestRecovery(startDispatch)];
+  const stopWorkers = config.queueEnabled ? startDispatchWorkers(startDispatch) : async () => {};
 
   await app.listen({ port: config.port, host: '0.0.0.0' });
 
   const shutdown = async () => {
     app.log.info('shutting down');
     timers.forEach(clearInterval);
+    await stopWorkers();
     gateway.clients.forEach((ws) => ws.terminate());
     await app.close();
     await eventStore.stop();

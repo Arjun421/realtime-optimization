@@ -28,6 +28,7 @@ interface SimAgent {
 }
 
 export const stats = {
+  glitches: 0,
   offersReceived: 0,
   accepted: 0,
   rejected: 0,
@@ -76,7 +77,13 @@ export class Fleet {
         a.darkUntil = now + between(20_000, 60_000);
       }
       if (now >= a.nextPingAt && now >= a.darkUntil) {
-        pings.push({ agentId: a.id, lat: a.pos.lat, lng: a.pos.lng, ts: now });
+        // The agent doesn't move; only this one reported fix is wrong.
+        let reported = a.pos;
+        if (Math.random() < config.gpsGlitchRate) {
+          stats.glitches++;
+          reported = offsetMeters(a.pos, between(3_000, 20_000), between(0, 2 * Math.PI));
+        }
+        pings.push({ agentId: a.id, lat: reported.lat, lng: reported.lng, ts: now });
         a.nextPingAt = now + config.pingIntervalMs * between(0.8, 1.2);
       }
     }

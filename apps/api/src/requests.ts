@@ -3,36 +3,42 @@ import type { Priority } from '@dispatch/shared';
 import { eventStore } from './db.js';
 import { dispatch } from './dispatch.js';
 import { sendToAgent } from './gateway.js';
-import { inc } from './metrics.js';
+import { zoneOf } from '@dispatch/shared';
+import { inc, metrics } from './metrics.js';
 import { indexEnded, keys, redis, REQUEST_TTL_S } from './redis.js';
+import { config } from './config.js';
+import { queueScore } from './queue.js';
+import { demandBucket } from './zones.js';
 
+/**
+ * Creates a request. With the queue on it is only enqueued, and `null` means
+ * the queue is full (the caller answers 429). With the queue off it is
+ * dispatched straight away.
+ */
 export async function createRequest(input: { lat: number; lng: number; priority: Priority }) {
   const id = randomUUID();
   const now = Date.now();
-  await redis
-    .multi()
-    .hset(keys.req(id), {
-      state: 'CREATED',
-      lat: input.lat,
-      lng: input.lng,
-      priority: input.priority,
-      attempts: 0,
-      createdAt: now,
-      updatedAt: now,
-    })
-    .expire(keys.req(id), REQUEST_TTL_S)
-    .zadd(keys.openRequests, now, id)
-    .exec();
+  const bucket = demandBucket(now);
+  const created = await redis.createRequest(
+    keys.req(id), keys.openRequests, keys.queue, bucket.key,
+    id, input.lat, input.lng, input.priority, now, config.maxQueue,
+    queueScore(input.priority, now), zoneOf(input), REQUEST_TTL_S, config.queueEnabled ? '1' : '0', bucket.ttlS,
+  );
+  if (!created) {
+    inc('requestsRejected');
+    return null;
+  }
 
   inc('requestsCreated');
   eventStore.recordRequest({ id, ...input, at: new Date(now) });
   eventStore.record({ requestId: id, event: 'CREATED', at: new Date(now) });
 
-  void startDispatch(id);
+  if (!config.queueEnabled) void startDispatch(id);
   return { id, state: 'CREATED' as const };
 }
 
-async function startDispatch(requestId: string) {
+/** CREATED → SEARCHING, then find an agent. Called by a queue worker, or directly when the queue is off. */
+export async function startDispatch(requestId: string) {
   try {
     const ok = await redis.transition(keys.req(requestId), 'CREATED', 'SEARCHING', Date.now(), '');
     if (!ok) return;
@@ -88,10 +94,13 @@ export async function onOfferResponse(requestId: string, agentId: string, accept
     return;
   }
 
+  const now = Date.now();
   inc('offersAccepted');
   inc('requestsAssigned');
   eventStore.record({ requestId, event: 'ASSIGNED', agentId });
-  const req = await redis.hmget(keys.req(requestId), 'lat', 'lng');
+  const req = await redis.hmget(keys.req(requestId), 'lat', 'lng', 'createdAt', 'offerDistM');
+  metrics.timeToAssignMs.add(now - Number(req[2]));
+  if (req[3]) metrics.assignedDistanceM.add(Number(req[3]));
   sendToAgent(agentId, {
     type: 'assigned',
     requestId,
@@ -104,7 +113,10 @@ export async function onTripUpdate(requestId: string, agentId: string, event: 'p
   const now = Date.now();
   if (event === 'picked_up') {
     const ok = await redis.transition(keys.req(requestId), 'ASSIGNED', 'PICKED_UP', now, agentId);
-    if (ok) eventStore.record({ requestId, event: 'PICKED_UP', agentId });
+    if (!ok) return;
+    eventStore.record({ requestId, event: 'PICKED_UP', agentId });
+    const createdAt = await redis.hget(keys.req(requestId), 'createdAt');
+    if (createdAt) metrics.waitToPickupMs.add(now - Number(createdAt));
     return;
   }
   const ok = await redis.completeTrip(keys.agent(agentId), keys.req(requestId), requestId, agentId, now);

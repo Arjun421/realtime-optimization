@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@deck.gl/core": "^9.4.0",
+    "@deck.gl/extensions": "^9.4.0",
     "@deck.gl/layers": "^9.4.0",
     "@deck.gl/react": "^9.4.0",
     "@dispatch/shared": "*",

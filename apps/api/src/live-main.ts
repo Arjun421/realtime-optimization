@@ -1,19 +1,27 @@
 import { createServer } from 'node:http';
 import { config } from './config.js';
-import { createLiveServer } from './live.js';
+import { createLiveServer, currentAlerts } from './live.js';
 import { redis } from './redis.js';
 
 /**
- * The dashboard feed runs as its own process. Building a 10k-agent snapshot
- * costs tens of milliseconds of CPU (parsing Redis replies, JSON.stringify),
- * and Node runs one thing at a time: inside the API that work made dispatch
- * wait and pushed its p99 up. Here it only shares Redis, and only reads.
+ * The live service runs as its own process. It reads all live state once a
+ * second, publishes zone supply/demand for dispatch, raises zone alerts and
+ * feeds dashboards. A 10k-agent pass costs tens of milliseconds of CPU
+ * (parsing Redis replies, JSON.stringify), and Node runs one thing at a time:
+ * inside the API that work made dispatch wait and pushed its p99 up. Here it
+ * only shares Redis, and its only writes are the zone stats.
  */
 const live = createLiveServer();
 
+const routes: Record<string, () => unknown> = {
+  '/health': () => ({ ok: true, dashboards: live.wss.clients.size }),
+  '/alerts': () => currentAlerts(),
+};
+
 const server = createServer((req, res) => {
-  res.writeHead(req.url === '/health' ? 200 : 404, { 'content-type': 'application/json' });
-  res.end(JSON.stringify(req.url === '/health' ? { ok: true, dashboards: live.wss.clients.size } : { error: 'not_found' }));
+  const route = routes[req.url ?? ''];
+  res.writeHead(route ? 200 : 404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(route ? route() : { error: 'not_found' }));
 });
 
 server.on('upgrade', (req, socket, head) => {

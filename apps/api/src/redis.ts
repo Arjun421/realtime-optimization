@@ -9,8 +9,12 @@ import { config } from './config.js';
  *   agents:lastseen     ZSET  agentId -> last ping time (ms)
  *   requests:open       ZSET  requestId -> createdAt, every request not yet finished (dashboard index)
  *   requests:ended      ZSET  requestId -> endedAt, requests finished in the last few seconds (dashboard index)
- *   agent:{id}          HASH  status (AVAILABLE|OFFERED|BUSY), requestId
- *   req:{id}            HASH  state, lat, lng, priority, agentId, attempts, createdAt, updatedAt
+ *   agent:{id}          HASH  status (AVAILABLE|OFFERED|BUSY), requestId, offers, accepts (answered offers only)
+ *   req:{id}            HASH  state, lat, lng, priority, agentId, attempts, offerDistM, createdAt, updatedAt
+ *   zones:stats         HASH  zone -> "supply|demandPerMin", rewritten every second by the live service
+ *   zones:demand:{min}  HASH  zone -> requests created in that epoch minute (expires after 15 min)
+ *   gps:anomalies       LIST  latest impossible-movement events, JSON, capped
+ *   dispatch:queue      ZSET  requestId -> priority rank × 1e13 + createdAt; workers pop the lowest
  *   req:{id}:tried      SET   agents already offered this request (never re-offer)
  *   offers:deadlines    ZSET  "{requestId}|{agentId}" -> offer expiry time (ms)
  */
@@ -24,6 +28,10 @@ export const keys = {
   agent: (id: string) => `agent:${id}`,
   req: (id: string) => `req:${id}`,
   tried: (id: string) => `req:${id}:tried`,
+  zoneStats: 'zones:stats',
+  zoneDemand: (minute: number) => `zones:demand:${minute}`,
+  anomalies: 'gps:anomalies',
+  queue: 'dispatch:queue',
 };
 
 /*
@@ -32,13 +40,13 @@ export const keys = {
  * "accept" from racing an offer timeout.
  */
 
-/** KEYS: agent, req, deadlines. ARGV: reqId, agentId, now, deadline.
+/** KEYS: agent, req, deadlines. ARGV: reqId, agentId, now, deadline, distanceM.
  *  Returns 1 = claimed, 0 = agent not available, -1 = request no longer searching. */
 const CLAIM_AGENT = `
 if redis.call('HGET', KEYS[2], 'state') ~= 'SEARCHING' then return -1 end
 if redis.call('HGET', KEYS[1], 'status') ~= 'AVAILABLE' then return 0 end
 redis.call('HSET', KEYS[1], 'status', 'OFFERED', 'requestId', ARGV[1])
-redis.call('HSET', KEYS[2], 'state', 'OFFERED', 'agentId', ARGV[2], 'updatedAt', ARGV[3])
+redis.call('HSET', KEYS[2], 'state', 'OFFERED', 'agentId', ARGV[2], 'updatedAt', ARGV[3], 'offerDistM', ARGV[5])
 redis.call('HINCRBY', KEYS[2], 'attempts', 1)
 redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1] .. '|' .. ARGV[2])
 return 1
@@ -50,6 +58,8 @@ if redis.call('HGET', KEYS[2], 'state') ~= 'OFFERED' then return 0 end
 if redis.call('HGET', KEYS[2], 'agentId') ~= ARGV[2] then return 0 end
 redis.call('HSET', KEYS[2], 'state', 'ASSIGNED', 'updatedAt', ARGV[3])
 redis.call('HSET', KEYS[1], 'status', 'BUSY', 'requestId', ARGV[1])
+redis.call('HINCRBY', KEYS[1], 'offers', 1)
+redis.call('HINCRBY', KEYS[1], 'accepts', 1)
 redis.call('ZREM', KEYS[3], ARGV[1] .. '|' .. ARGV[2])
 return 1
 `;
@@ -65,6 +75,7 @@ if redis.call('HGET', KEYS[1], 'requestId') == ARGV[1] then
   redis.call('HSET', KEYS[1], 'status', 'AVAILABLE')
   redis.call('HDEL', KEYS[1], 'requestId')
 end
+redis.call('HINCRBY', KEYS[1], 'offers', 1)
 redis.call('ZREM', KEYS[3], ARGV[1] .. '|' .. ARGV[2])
 redis.call('SADD', KEYS[4], ARGV[2])
 redis.call('EXPIRE', KEYS[4], 21600)
@@ -114,6 +125,25 @@ end
 return ''
 `;
 
+/** Creates a request and (optionally) queues it, or refuses because the queue is full.
+ *  One script, so a full queue never leaves a half-created request behind and a worker
+ *  never pops an id whose hash doesn't exist yet.
+ *  KEYS: req, open, queue, demandBucket.
+ *  ARGV: id, lat, lng, priority, now, maxQueue, queueScore, zone, ttlS, useQueue ('1'|'0'), bucketTtlS.
+ *  Returns 1 if created, 0 if the queue was full. */
+const CREATE_REQUEST = `
+local useQueue = ARGV[10] == '1'
+if useQueue and redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[6]) then return 0 end
+redis.call('HSET', KEYS[1], 'state', 'CREATED', 'lat', ARGV[2], 'lng', ARGV[3], 'priority', ARGV[4],
+  'attempts', 0, 'createdAt', ARGV[5], 'updatedAt', ARGV[5])
+redis.call('EXPIRE', KEYS[1], ARGV[9])
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[1])
+redis.call('HINCRBY', KEYS[4], ARGV[8], 1)
+redis.call('EXPIRE', KEYS[4], ARGV[11])
+if useQueue then redis.call('ZADD', KEYS[3], ARGV[7], ARGV[1]) end
+return 1
+`;
+
 /** Read-only bulk HMGET: one reply per key instead of one command per key.
  *  KEYS: hashes. ARGV: fields. Returns one array of values per key. */
 const HMGET_MANY = `
@@ -133,6 +163,7 @@ declare module 'ioredis' {
     completeTrip(agentKey: string, reqKey: string, ...argv: Arg[]): Result<number, Context>;
     cancelRequest(reqKey: string, deadlinesKey: string, ...argv: Arg[]): Result<string | null, Context>;
     hmgetMany(numKeys: number, ...keysThenFields: string[]): Result<(string | null)[][], Context>;
+    createRequest(reqKey: string, openKey: string, queueKey: string, bucketKey: string, ...argv: Arg[]): Result<number, Context>;
   }
 }
 
@@ -145,6 +176,7 @@ redis.defineCommand('transition', { numberOfKeys: 1, lua: TRANSITION });
 redis.defineCommand('completeTrip', { numberOfKeys: 2, lua: COMPLETE_TRIP });
 redis.defineCommand('cancelRequest', { numberOfKeys: 2, lua: CANCEL_REQUEST });
 redis.defineCommand('hmgetMany', { lua: HMGET_MANY });
+redis.defineCommand('createRequest', { numberOfKeys: 4, lua: CREATE_REQUEST });
 
 export const REQUEST_TTL_S = 6 * 60 * 60;
 /** Finished requests stay on the dashboard this long. */

@@ -7,16 +7,19 @@
     "apps/*"
   ],
   "scripts": {
+    "dev": "docker compose up -d --wait && concurrently -k -n api,live,sim,dash -c blue,magenta,green,cyan \"npm run dev:api\" \"npm run dev:live\" \"npm run dev:sim\" \"npm run dev:dashboard\"",
     "infra:up": "docker compose up -d",
     "infra:down": "docker compose down",
     "dev:api": "npm run dev -w @dispatch/api",
     "dev:live": "npm run dev:live -w @dispatch/api",
     "dev:sim": "npm run dev -w @dispatch/simulator",
     "typecheck": "tsc -p apps/api && tsc -p apps/simulator && tsc -p apps/dashboard",
-    "dev:dashboard": "npm run dev -w @dispatch/dashboard"
+    "dev:dashboard": "npm run dev -w @dispatch/dashboard",
+    "test": "npm test -w @dispatch/api"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "concurrently": "^9.2.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

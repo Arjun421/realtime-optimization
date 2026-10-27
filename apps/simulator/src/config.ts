@@ -15,4 +15,6 @@ export const config = {
   darkRatePerTick: num('DARK_RATE', 0.00025),
   /** Share of offers an agent simply never answers (forces the offer-timeout path). */
   ignoreOfferRate: num('IGNORE_OFFER_RATE', 0.05),
+  /** Share of pings that report a bogus position 3-20 km away (GPS glitch), to exercise jump detection. */
+  gpsGlitchRate: num('GPS_GLITCH_RATE', 0.001),
 };

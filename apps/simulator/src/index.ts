@@ -81,7 +81,7 @@ async function report() {
   }
   console.log(
     `[sim] idle=${modes.idle} offered=${modes.offered} pickup=${modes.to_pickup} dropoff=${modes.to_dropoff} dark=${modes.dark}` +
-      ` | requests=${requestsSent} errors=${requestErrors} offers=${stats.offersReceived}` +
+      ` | glitches=${stats.glitches} requests=${requestsSent} errors=${requestErrors} offers=${stats.offersReceived}` +
       ` accepted=${stats.accepted} rejected=${stats.rejected} ignored=${stats.ignored} completed=${stats.completed}` +
       api,
   );

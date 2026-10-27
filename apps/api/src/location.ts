@@ -1,12 +1,15 @@
 import { CITY_BOUNDS, type LocationPing } from '@dispatch/shared';
 import { config } from './config.js';
 import { inc } from './metrics.js';
+import { checkMovement, forgetAgent, lastFixTs } from './movement.js';
 import { keys, redis } from './redis.js';
 
 /** Agents with no ping for this long are forgotten entirely. */
 const FORGET_AFTER_MS = 10 * 60_000;
 
 const knownAgents = new Set<string>();
+/** How many anomalies the dashboard list keeps. */
+const ANOMALY_LOG_SIZE = 100;
 
 function isValid(p: LocationPing): boolean {
   return (
@@ -25,12 +28,13 @@ function isValid(p: LocationPing): boolean {
 /**
  * Writes a batch of pings with three commands total (two GEOADDs, one ZADD),
  * however many agents are in the batch. That's what keeps 10k agents pinging
- * every few seconds cheap.
+ * every few seconds cheap. Impossible jumps are filtered out first.
  */
 export async function ingestLocations(items: LocationPing[]): Promise<void> {
   const now = Date.now();
   const geoArgs: (string | number)[] = [];
   const seenArgs: (string | number)[] = [];
+  const anomalies: string[] = [];
   const pipeline = redis.pipeline();
 
   for (const p of items) {
@@ -38,15 +42,32 @@ export async function ingestLocations(items: LocationPing[]): Promise<void> {
       inc('pingsRejected');
       continue;
     }
-    geoArgs.push(p.lng, p.lat, p.agentId);
     // Clamp device time so a skewed clock can't make an agent look fresher than it is.
-    seenArgs.push(Math.min(p.ts, now), p.agentId);
+    const ts = Math.min(p.ts, now);
+    const prevTs = lastFixTs(p.agentId);
+    if (prevTs !== undefined && ts <= prevTs) {
+      inc('pingsRejected'); // duplicate or out of order
+      continue;
+    }
+    const { accept, anomaly } = checkMovement(p.agentId, { lat: p.lat, lng: p.lng, ts });
+    if (anomaly) anomalies.push(JSON.stringify(anomaly));
+    if (!accept) continue;
+
+    geoArgs.push(p.lng, p.lat, p.agentId);
+    seenArgs.push(ts, p.agentId);
     if (!knownAgents.has(p.agentId)) {
       knownAgents.add(p.agentId);
       pipeline.hsetnx(keys.agent(p.agentId), 'status', 'AVAILABLE');
     }
   }
-  if (geoArgs.length === 0) return;
+  if (anomalies.length) {
+    pipeline.lpush(keys.anomalies, ...anomalies);
+    pipeline.ltrim(keys.anomalies, 0, ANOMALY_LOG_SIZE - 1);
+  }
+  if (geoArgs.length === 0) {
+    await pipeline.exec();
+    return;
+  }
 
   pipeline.geoadd(keys.geo, ...geoArgs);
   pipeline.geoadd(keys.pos, ...geoArgs);
@@ -71,7 +92,10 @@ export function startStaleSweeper(intervalMs = 2_000): NodeJS.Timeout {
       if (forgotten.length) {
         await redis.zrem(keys.lastSeen, ...forgotten);
         await redis.zrem(keys.pos, ...forgotten);
-        forgotten.forEach((id) => knownAgents.delete(id));
+        for (const id of forgotten) {
+          knownAgents.delete(id);
+          forgetAgent(id);
+        }
       }
     } catch (err) {
       console.error('[sweeper] failed', err);
